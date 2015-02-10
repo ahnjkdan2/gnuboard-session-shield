@@ -209,7 +209,7 @@ class Session_Shield
 		else
 		{
 			$_SESSION[self::ARRAY_KEY]['cookie'] = $this->getRandomString();
-			$_SESSION[self::ARRAY_KEY]['cookie_ssl'] = $this->getRandomString();
+			if($this->isSecureRequest()) $_SESSION[self::ARRAY_KEY]['cookie_ssl'] = $this->getRandomString();
 			$_SESSION[self::ARRAY_KEY]['last_refresh'] = time();
 			$_SESSION[self::ARRAY_KEY]['need_refresh'] = false;
 			$_SESSION[self::ARRAY_KEY]['member_id'] = $this->getMemberID();
