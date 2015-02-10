@@ -245,30 +245,23 @@ class Session_Shield
      */
     public function getRandomString()
     {
-        if (class_exists('Password') && ($pw = new Password()) && method_exists($pw, 'createSecureSalt'))
+        $is_windows = (defined('PHP_OS') && strtoupper(substr(PHP_OS, 0, 3)) === 'WIN');
+        if (function_exists('openssl_random_pseudo_bytes') && (!$is_windows || version_compare(PHP_VERSION, '5.4', '>=')))
         {
-            return $pw->createSecureSalt(40, 'hex');
+            return hash(self::COOKIE_HASH_ALGO, openssl_random_pseudo_bytes(20));
+        }
+        elseif (function_exists('mcrypt_create_iv') && (!$is_windows || version_compare(PHP_VERSION, '5.3.7', '>=')))
+        {
+            return hash(self::COOKIE_HASH_ALGO, mcrypt_create_iv(20, MCRYPT_DEV_URANDOM));
         }
         else
         {
-            $is_windows = (defined('PHP_OS') && strtoupper(substr(PHP_OS, 0, 3)) === 'WIN');
-            if (function_exists('openssl_random_pseudo_bytes') && (!$is_windows || version_compare(PHP_VERSION, '5.4', '>=')))
+            $result = sprintf('%s %s %s', rand(), mt_rand(), microtime());
+            for ($i = 0; $i < 100; $i++)
             {
-                return hash(self::COOKIE_HASH_ALGO, openssl_random_pseudo_bytes(20));
+                $result = hash(self::COOKIE_HASH_ALGO, $result . mt_rand());
             }
-            elseif (function_exists('mcrypt_create_iv') && (!$is_windows || version_compare(PHP_VERSION, '5.3.7', '>=')))
-            {
-                return hash(self::COOKIE_HASH_ALGO, mcrypt_create_iv(20, MCRYPT_DEV_URANDOM));
-            }
-            else
-            {
-                $result = sprintf('%s %s %s', rand(), mt_rand(), microtime());
-                for ($i = 0; $i < 100; $i++)
-                {
-                    $result = hash(self::COOKIE_HASH_ALGO, $result . mt_rand());
-                }
-                return $result;
-            }
+            return $result;
         }
     }
 }
