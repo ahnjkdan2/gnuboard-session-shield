@@ -69,7 +69,9 @@ class Session_Shield
     public function isStupidBrowser()
     {
         $ua = isset($_SERVER['HTTP_USER_AGENT']) ? $_SERVER['HTTP_USER_AGENT'] : '';
-        return (strpos($ua, 'MSIE 8.0') !== false || strpos($ua, 'Trident/4.0') !== false);
+        if (strpos($ua, 'MSIE 8.0') !== false || strpos($ua, 'Trident/4.0') !== false) return true;
+        if (strpos($ua, 'BlackBerry') !== false) return true;
+        return false;
     }
     
     /**
