@@ -8,6 +8,7 @@
  * 자세한 설명은 XE용 애드온 참고: https://github.com/kijin/xe-session-shield
  * 
  * Copyright (c) 2015 Kijin Sung <kijin@kijinsung.com>
+ * License: LGPL v2.1 <http://www.gnu.org/licenses/lgpl-2.1.html>
  */
 
 class Session_Shield
@@ -22,7 +23,9 @@ class Session_Shield
     const INIT_LEVEL_NONE = 0;
     const INIT_LEVEL_BASIC = 1;
     const INIT_LEVEL_SSL = 2;
-    const REFRESH_TIMEOUT = 300;
+    const EXTRA_LIFETIME = 14400;
+    const REFRESH_TIMEOUT = 600;
+    const GRACE_PERIOD = 60;
     
     /**
      * Check if the session is active.
@@ -48,6 +51,14 @@ class Session_Shield
      */
     public function isShieldEnabled()
     {
+        if ($_SERVER['REQUEST_METHOD'] !== 'GET' && $this->isFlash())
+        {
+            return false;
+        }
+        if (headers_sent())
+        {
+            return false;
+        }
         return true;
     }
     
@@ -62,16 +73,23 @@ class Session_Shield
     }
     
     /**
-     * Check if the user's browser is known to forget session cookies.
+     * Check if the current request uses AJAX.
      * 
      * @return bool
      */
-    public function isStupidBrowser()
+    public function isAjax()
     {
-        $ua = isset($_SERVER['HTTP_USER_AGENT']) ? $_SERVER['HTTP_USER_AGENT'] : '';
-        if (strpos($ua, 'MSIE 8.0') !== false || strpos($ua, 'Trident/4.0') !== false) return true;
-        if (strpos($ua, 'BlackBerry') !== false) return true;
-        return false;
+        return (isset($_SERVER['HTTP_X_REQUESTED_WITH']) && strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest');
+    }
+    
+    /**
+     * Check if the current request uses Flash.
+     * 
+     * @return bool
+     */
+    public function isFlash()
+    {
+        return (isset($_SERVER['HTTP_USER_AGENT']) && preg_match('/shockwave\s?flash/i', $_SERVER['HTTP_USER_AGENT']));
     }
     
     /**
@@ -91,19 +109,36 @@ class Session_Shield
      */
     public function initialize()
     {
-        if (!$this->isSessionActive()) return false;
+        if (!$this->isSessionActive()) return true;
         if (!$this->isShieldEnabled()) return true;
         
-        if (!isset($_SESSION[self::ARRAY_KEY]))
+        if (!isset($_SESSION[self::ARRAY_KEY]['login']))
         {
             $_SESSION[self::ARRAY_KEY] = array(
                 'init' => self::INIT_LEVEL_NONE,
-                'cookie' => $this->getRandomString(),
-                'cookie_ssl' => $this->isSecureRequest() ? $this->getRandomString() : '',
-                'last_refresh' => time(),
-                'need_refresh' => false,
-                'member_id' => $this->getMemberID(),
+                'login' => $this->getMemberID(),
+                'cookie' => array(
+                    'value' => $this->getRandomString(),
+                    'previous' => null,
+                    'last_refresh' => time(),
+                    'need_refresh' => false,
+                ),
+                'cookie_ssl' => array(
+                    'value' => null,
+                    'previous' => null,
+                    'last_refresh' => null,
+                    'need_refresh' => false,
+                ),
             );
+            if ($this->isSecureRequest())
+            {
+                $_SESSION[self::ARRAY_KEY]['cookie_ssl'] = array(
+                    'value' => $this->getRandomString(),
+                    'previous' => null,
+                    'last_refresh' => time(),
+                    'need_refresh' => false,
+                );
+            }
             $this->setShieldCookies();
             return true;
         }
@@ -120,12 +155,24 @@ class Session_Shield
      */
     public function checkCookies()
     {
-        if ($_SESSION[self::ARRAY_KEY]['init'] == self::INIT_LEVEL_NONE) return false;
+        $cookie = isset($_COOKIE[self::COOKIE_NAME]) ? $_COOKIE[self::COOKIE_NAME] : 'none';
+        $cookie_ssl = isset($_COOKIE[self::COOKIE_NAME_SSL]) ? $_COOKIE[self::COOKIE_NAME_SSL] : 'none';
+        $resend_cookies = false;
         
-        $cookie = isset($_COOKIE[self::COOKIE_NAME]) ? $_COOKIE[self::COOKIE_NAME] : false;
-        $cookie_ssl = isset($_COOKIE[self::COOKIE_NAME_SSL]) ? $_COOKIE[self::COOKIE_NAME_SSL] : false;
-        
-        if ($cookie === false || $cookie !== $_SESSION[self::ARRAY_KEY]['cookie'])
+        if ($_SESSION[self::ARRAY_KEY]['init'] == self::INIT_LEVEL_NONE)
+        {
+            return true;
+        }
+        elseif ($cookie === $_SESSION[self::ARRAY_KEY]['cookie']['value'])
+        {
+            // pass
+        }
+        elseif ($cookie === $_SESSION[self::ARRAY_KEY]['cookie']['previous'] &&
+            $_SESSION[self::ARRAY_KEY]['cookie']['last_refresh'] > time() - self::GRACE_PERIOD)
+        {
+            $resend_cookies = true;
+        }
+        else
         {
             $this->destroySession();
             return false;
@@ -136,15 +183,32 @@ class Session_Shield
             if ($_SESSION[self::ARRAY_KEY]['init'] < self::INIT_LEVEL_SSL)
             {
                 $this->refreshSession();
+                return true;
             }
-            elseif ($cookie_ssl === false || $cookie_ssl !== $_SESSION[self::ARRAY_KEY]['cookie_ssl'])
+            elseif ($cookie_ssl === $_SESSION[self::ARRAY_KEY]['cookie_ssl']['value'])
+            {
+                // pass
+            }
+            elseif ($cookie_ssl === $_SESSION[self::ARRAY_KEY]['cookie_ssl']['previous'] &&
+                $_SESSION[self::ARRAY_KEY]['cookie_ssl']['last_refresh'] > time() - self::GRACE_PERIOD)
+            {
+                $resend_cookies = true;
+            }
+            else
             {
                 $this->destroySession();
                 return false;
             }
         }
         
-        return true;
+        if ($resend_cookies)
+        {
+            return $this->setShieldCookies();
+        }
+        else
+        {
+            return true;
+        }
     }
     
     /**
@@ -154,20 +218,16 @@ class Session_Shield
      */
     public function checkTimeout()
     {
-        if ($_SESSION[self::ARRAY_KEY]['need_refresh'] || $_SESSION[self::ARRAY_KEY]['last_refresh'] < time() - self::REFRESH_TIMEOUT)
+        if (
+            ($this->getMemberID() !== $_SESSION[self::ARRAY_KEY]['login']) ||
+            ($_SESSION[self::ARRAY_KEY]['cookie']['need_refresh']) ||
+            ($_SESSION[self::ARRAY_KEY]['cookie_ssl']['need_refresh'] && $this->isSecureRequest()) ||
+            (self::REFRESH_TIMEOUT > 0 && $_SESSION[self::ARRAY_KEY]['cookie']['last_refresh'] < time() - self::REFRESH_TIMEOUT) ||
+            (self::REFRESH_TIMEOUT > 0 && $_SESSION[self::ARRAY_KEY]['cookie_ssl']['last_refresh'] < time() - self::REFRESH_TIMEOUT && $this->isSecureRequest()))
         {
             $this->refreshSession();
-            return true;
         }
-        elseif ($this->getMemberID() !== $_SESSION[self::ARRAY_KEY]['member_id'])
-        {
-            $this->refreshSession();
-            return true;
-        }
-        else
-        {
-            return true;
-        }
+        return true;
     }
     
     /**
@@ -177,20 +237,34 @@ class Session_Shield
      */
     public function setShieldCookies()
     {
-        if (headers_sent()) return false;
-        
         $params = session_get_cookie_params();
-        if ($_SESSION[self::ARRAY_KEY]['cookie'] !== '')
+        $expiry = $params['lifetime'] > 0 ? (time() + $params['lifetime'] + self::EXTRA_LIFETIME) : 0;
+        if ($_SESSION[self::ARRAY_KEY]['cookie']['value'] !== null)
         {
-            setcookie(self::COOKIE_NAME, $_SESSION[self::ARRAY_KEY]['cookie'],
-                $params['lifetime'], $params['path'], $params['domain'], false, true);
-            $_SESSION[self::ARRAY_KEY]['init'] = max($_SESSION[self::ARRAY_KEY]['init'], self::INIT_LEVEL_BASIC);
+            $cookie_status = @setcookie(self::COOKIE_NAME, $_SESSION[self::ARRAY_KEY]['cookie']['value'],
+                $expiry, $params['path'], $params['domain'], false, true);
+            if ($cookie_status)
+            {
+                $_SESSION[self::ARRAY_KEY]['init'] = max($_SESSION[self::ARRAY_KEY]['init'], self::INIT_LEVEL_BASIC);
+            }
+            else
+            {
+                return false;
+            }
         }
-        if ($_SESSION[self::ARRAY_KEY]['cookie_ssl'] !== '' && $this->isSecureRequest())
+        
+        if ($_SESSION[self::ARRAY_KEY]['cookie_ssl']['value'] !== null && $this->isSecureRequest())
         {
-            setcookie(self::COOKIE_NAME_SSL, $_SESSION[self::ARRAY_KEY]['cookie_ssl'],
-                $params['lifetime'], $params['path'], $params['domain'], true, true);
-            $_SESSION[self::ARRAY_KEY]['init'] = max($_SESSION[self::ARRAY_KEY]['init'], self::INIT_LEVEL_SSL);
+            $cookie_status = @setcookie(self::COOKIE_NAME_SSL, $_SESSION[self::ARRAY_KEY]['cookie_ssl']['value'],
+                $expiry, $params['path'], $params['domain'], true, true);
+            if ($cookie_status)
+            {
+                $_SESSION[self::ARRAY_KEY]['init'] = max($_SESSION[self::ARRAY_KEY]['init'], self::INIT_LEVEL_SSL);
+            }
+            else
+            {
+                return false;
+            }
         }
         
         return true;
@@ -203,19 +277,59 @@ class Session_Shield
      */
     public function refreshSession()
     {
-        if ($this->isStupidBrowser() && $_SERVER['REQUEST_METHOD'] !== 'GET')
+        if ($_SERVER['REQUEST_METHOD'] !== 'GET' || $this->isAjax() || $this->isFlash())
         {
-            $_SESSION[self::ARRAY_KEY]['need_refresh'] = true;
+            $_SESSION[self::ARRAY_KEY]['cookie']['need_refresh'] = true;
+            if ($this->isSecureRequest())
+            {
+                $_SESSION[self::ARRAY_KEY]['cookie_ssl']['need_refresh'] = true;
+            }
             return false;
         }
         else
         {
-            $_SESSION[self::ARRAY_KEY]['cookie'] = $this->getRandomString();
-            if ($this->isSecureRequest()) $_SESSION[self::ARRAY_KEY]['cookie_ssl'] = $this->getRandomString();
-            $_SESSION[self::ARRAY_KEY]['last_refresh'] = time();
-            $_SESSION[self::ARRAY_KEY]['need_refresh'] = false;
-            $_SESSION[self::ARRAY_KEY]['member_id'] = $this->getMemberID();
-            return $this->setShieldCookies();
+            $precomputed_random1 = $this->getRandomString();
+            $precomputed_random2 = $this->isSecureRequest() ? $this->getRandomString() : null;
+            $previous_session = $_SESSION[self::ARRAY_KEY];
+            if (headers_sent())
+            {
+                return false;
+            }
+            
+            $previous_value = $_SESSION[self::ARRAY_KEY]['cookie']['value'];
+            session_write_close(); $_SESSION = array(); session_start();
+            if ($_SESSION[self::ARRAY_KEY]['cookie']['value'] !== $previous_value)
+            {
+                return false;
+            }
+            
+            $_SESSION[self::ARRAY_KEY]['cookie']['previous'] = $_SESSION[self::ARRAY_KEY]['cookie']['value'];
+            $_SESSION[self::ARRAY_KEY]['cookie']['value'] = $precomputed_random1;
+            $_SESSION[self::ARRAY_KEY]['cookie']['last_refresh'] = time();
+            $_SESSION[self::ARRAY_KEY]['cookie']['need_refresh'] = false;
+            if ($this->isSecureRequest())
+            {
+                $_SESSION[self::ARRAY_KEY]['cookie_ssl']['previous'] = $_SESSION[self::ARRAY_KEY]['cookie_ssl']['value'];
+                $_SESSION[self::ARRAY_KEY]['cookie_ssl']['value'] = $precomputed_random2;
+                $_SESSION[self::ARRAY_KEY]['cookie_ssl']['last_refresh'] = time();
+                $_SESSION[self::ARRAY_KEY]['cookie_ssl']['need_refresh'] = false;
+            }
+            $_SESSION[self::ARRAY_KEY]['login'] = $this->getMemberID();
+            
+            $previous_value = $_SESSION[self::ARRAY_KEY]['cookie']['value'];
+            session_write_close(); $_SESSION = array(); session_start();
+            if ($_SESSION[self::ARRAY_KEY]['cookie']['value'] !== $previous_value)
+            {
+                return false;
+            }
+            
+            $cookie_status = $this->setShieldCookies();
+            if (!$cookie_status)
+            {
+                $_SESSION[self::ARRAY_KEY] = $previous_session;
+                session_write_close();
+                session_start();
+            }
         }
     }
     
